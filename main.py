@@ -5,6 +5,7 @@ import os
 import sys
 import logging
 from datetime import datetime, timedelta
+import snscrape.modules.twitter as sntwitter
 
 # Suppress Prophet logs and warnings
 import prophet.utilities as prophet_utils
@@ -43,6 +44,27 @@ def download_nltk_data():
             logging.error(f"Failed to download VADER lexicon: {e}")
             print(f"Error: Could not download VADER lexicon. Please check your internet connection or install manually. Details: {e}", file=sys.stderr)
             sys.exit(1)
+
+# --- Twitter Data Scraping ---
+def fetch_tweets(keyword, max_results=500):
+    """Scrapes tweets for a given keyword using snscrape."""
+    logging.info(f"Scraping tweets for keyword: {keyword} (max: {max_results})")
+    tweets = []
+    try:
+        for i, tweet in enumerate(sntwitter.TwitterSearchScraper(f'{keyword} lang:en').get_items()):
+            if i >= max_results:
+                break
+            tweets.append([tweet.date, tweet.content, keyword])
+            if (i + 1) % 100 == 0:
+                logging.info(f"Scraped {i + 1} tweets so far...")
+        
+        # Create DataFrame with needed columns
+        df = pd.DataFrame(tweets, columns=['timestamp', 'text', 'meme_name'])
+        logging.info(f"Successfully scraped {len(df)} tweets for '{keyword}'")
+        return df
+    except Exception as e:
+        logging.error(f"Error scraping tweets: {e}")
+        raise ValueError(f"Failed to scrape tweets: {e}")
 
 # --- Data Ingestion ---
 def load_data(file_path: str, meme_name: str) -> pd.DataFrame:
@@ -168,7 +190,6 @@ def forecast_trend(daily_data: pd.DataFrame, periods: int) -> tuple[pd.DataFrame
         # Don't raise here, allow visualization of historical data if possible
         return None, None
 
-
 # --- Peak Virality Calculation ---
 def predict_peak_virality(forecast: pd.DataFrame, historical_end_date: pd.Timestamp) -> tuple[pd.Timestamp | None, float | None]:
     """Estimates the peak virality window based on the forecast."""
@@ -273,11 +294,22 @@ def visualize_results(
         logging.error(f"An error occurred during visualization: {e}")
         # Don't crash the whole program, just log the error
 
+# --- Data Export ---
+def export_to_csv(df: pd.DataFrame, meme_name: str, output_dir: str):
+    """Exports scraped and analyzed data to CSV."""
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"{meme_name}_data.csv")
+    df.to_csv(output_path, index=False)
+    logging.info(f"Data exported to {output_path}")
+    return output_path
+
 # --- Main Execution ---
 def main():
     parser = argparse.ArgumentParser(description="ChronoMeme Forecaster: Predict meme virality trends.")
-    parser.add_argument("meme_name", help="The name of the meme to analyze (case-insensitive).")
-    parser.add_argument("-i", "--input-file", required=True, help="Path to the input CSV data file (columns: timestamp, text, meme_name).")
+    parser.add_argument("meme_name", help="The name of the meme/keyword to analyze (case-insensitive).")
+    parser.add_argument("-i", "--input-file", help="Path to existing input CSV data file (columns: timestamp, text, meme_name).")
+    parser.add_argument("-s", "--scrape", action="store_true", help="Scrape Twitter data instead of using input file.")
+    parser.add_argument("-m", "--max-tweets", type=int, default=500, help="Maximum number of tweets to scrape (only used with --scrape).")
     parser.add_argument("-o", "--output-dir", default="meme_forecast_output", help="Directory to save plots and results.")
     parser.add_argument("-p", "--periods", type=int, default=30, help="Number of days to forecast into the future.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
@@ -291,11 +323,26 @@ def main():
         # 0. Setup (NLTK data)
         download_nltk_data()
 
-        # 1. Data Ingestion
-        raw_data = load_data(args.input_file, args.meme_name)
-        if raw_data.empty:
-            print(f"No data found for meme '{args.meme_name}'. Exiting.", file=sys.stderr)
-            sys.exit(0) # Not an error, just no data
+        # 1. Data Acquisition
+        if args.scrape:
+            logging.info(f"Scraping mode activated for meme/keyword: {args.meme_name}")
+            raw_data = fetch_tweets(args.meme_name, args.max_tweets)
+            if raw_data.empty:
+                print(f"No tweets found for '{args.meme_name}'. Exiting.", file=sys.stderr)
+                sys.exit(0)
+            
+            # Export scraped data to CSV
+            csv_path = export_to_csv(raw_data, args.meme_name, args.output_dir)
+            print(f"Scraped data saved to: {csv_path}")
+        elif args.input_file:
+            # 1. Data Ingestion from file
+            raw_data = load_data(args.input_file, args.meme_name)
+            if raw_data.empty:
+                print(f"No data found for meme '{args.meme_name}'. Exiting.", file=sys.stderr)
+                sys.exit(0) # Not an error, just no data
+        else:
+            print("Error: Either --input-file or --scrape must be specified.", file=sys.stderr)
+            sys.exit(1)
 
         # 2. Sentiment Analysis & Daily Aggregation
         daily_summary_data = analyze_sentiment(raw_data)
@@ -316,14 +363,16 @@ def main():
         else:
              logging.warning("Forecasting failed or produced no results. Skipping peak prediction.")
 
-
         # 5. Visualization
         visualize_results(args.meme_name, daily_summary_data, forecast_data, peak_date, args.output_dir)
 
         # 6. Output Summary
         print("\n--- ChronoMeme Forecaster Summary ---")
-        print(f"Meme Analyzed: {args.meme_name}")
-        print(f"Data Source: {args.input_file}")
+        print(f"Meme/Keyword Analyzed: {args.meme_name}")
+        if args.scrape:
+            print(f"Data Source: Twitter (scraped {len(raw_data)} tweets)")
+        else:
+            print(f"Data Source: {args.input_file}")
         print(f"Historical Data Range: {daily_summary_data['ds'].min().strftime('%Y-%m-%d')} to {historical_end_date.strftime('%Y-%m-%d')}")
         print(f"Forecast Period: {args.periods} days")
         if forecast_data is not None:
@@ -350,40 +399,23 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    # Example Usage:
-    # Create a dummy CSV file 'mock_meme_data.csv':
-    # timestamp,text,meme_name
-    # 2023-01-01 10:00:00,"Haha, funny Doge meme! #doge",Doge
-    # 2023-01-01 12:00:00,"Wow, much confuse #doge",Doge
-    # 2023-01-02 09:00:00,"This Doge picture is hilarious",Doge
-    # 2023-01-02 15:00:00,"Bad Doge meme, not funny",Doge
-    # 2023-01-03 11:00:00,"So Doge, very meme",Doge
-    # ... (add more data spanning several weeks/months for better results)
-    # 2023-03-15 10:00:00,"Is Doge still a thing?",Doge
-    # 2023-01-05 10:00:00,"Grumpy cat is always relevant",Grumpy Cat
-    # 2023-01-06 11:00:00,"I hate Mondays #grumpycat",Grumpy Cat
-
-    # Run from command line:
-    # python main.py Doge -i mock_meme_data.csv -o doge_output -p 14 -v
-
+    # Example Usage with existing CSV file:
+    # python meme_virality_forecaster.py Doge -i mock_meme_data.csv -o doge_output -p 14 -v
+    
+    # Example Usage with Twitter scraping:
+    # python meme_virality_forecaster.py "cat meme" -s -m 1000 -o cat_meme_output -p 30 -v
+    
     # Check if running as main script or imported
     if len(sys.argv) > 1: # Basic check if arguments were passed
          main()
     else:
         # Provide guidance if run without arguments
-        print("Usage: python main.py <meme_name> -i <input_file.csv> [options]")
-        print("Example: python main.py Doge -i mock_meme_data.csv -o doge_output -p 30")
+        print("ChronoMeme Forecaster: A tool for meme virality prediction")
+        print("\nUsage options:")
+        print("1. With existing data:")
+        print("   python meme_virality_forecaster.py <meme_name> -i <input_file.csv> [options]")
+        print("   Example: python meme_virality_forecaster.py Doge -i meme_data.csv -o doge_output -p 30")
+        print("\n2. With Twitter scraping:")
+        print("   python meme_virality_forecaster.py <keyword> -s [options]")
+        print("   Example: python meme_virality_forecaster.py \"cat meme\" -s -m 1000 -o cat_meme_output")
         print("\nRun with --help for more options.")
-        # Optionally, create dummy data and run for demonstration if no args provided
-        # For now, just exit if no arguments are given in a typical run scenario.
-        # If you want a demo mode, you'd add logic here to create mock_meme_data.csv
-        # and call main() with default arguments.
-        # Example (requires creating the file first):
-        # if not os.path.exists("mock_meme_data.csv"):
-        #     print("Creating dummy mock_meme_data.csv for demonstration...")
-        #     # Add code here to create the CSV file content shown above
-        #     with open("mock_meme_data.csv", "w") as f:
-        #          f.write("timestamp,text,meme_name\n")
-        #          f.write("...") # Add dummy data rows
-        # sys.argv.extend(["Doge", "-i", "mock_meme_data.csv", "-o", "demo_output", "-p", "7"])
-        # main()
